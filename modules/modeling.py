@@ -12,6 +12,7 @@ from modules.module_cross import CrossModel, CrossConfig, Transformer as Transfo
 
 from modules.module_clip import CLIP, convert_weights
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
+from modules.slot_adapter import SlotAdapter
 
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
@@ -50,6 +51,28 @@ class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
         cross_config, _ = CrossConfig.get_config(cross_model_name, cache_dir, type_vocab_size, state_dict=None, task_config=task_config)
 
         model = cls(cross_config, clip_state_dict, *inputs, **kwargs)
+
+        use_psa = hasattr(task_config, 'use_psa') and task_config.use_psa
+        model.use_psa = bool(use_psa)
+
+        # 与 PLOT 配套的默认值（和源码一致）
+        num_slots = getattr(task_config, 'num_slots', 8)
+        num_iters = getattr(task_config, 'num_slot_iters', 5)
+        model.start_recon  = getattr(task_config, 'start_recon', 0)      # PLOT: default 5
+        model.start_metric = getattr(task_config, 'start_metric', 10)    # PLOT: default 15
+        model.recon_weight   = getattr(task_config, 'recon_weight', 0.01)  # PLOT 中固定 0.01
+        model.partnce_weight = getattr(task_config, 'partnce_weight', 1.0) # PLOT 没单独权重，等价 1.0
+
+        if model.use_psa:
+            dim = clip_state_dict['text_projection'].size(1)
+            model.plot = SlotAdapter(dim=dim, num_slots=num_slots, num_iters=num_iters)
+        else:
+            model.plot = None
+
+        plot_temperature = getattr(task_config, 'plot_temperature', 0.015)   # 可配
+        plot_logit_scale = torch.tensor(1.0 / plot_temperature, dtype=torch.float32)
+        # 用 buffer 保存，能随 .to(device) 与 checkpoint 同步；且不会被 optimizer 更新
+        model.register_buffer('plot_logit_scale', plot_logit_scale)
 
         ## ===> Initialization trick [HARD CODE]
         if model.linear_patch == "3d":
@@ -258,7 +281,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         video = video.view(b * pair * bs * ts, channel, h, w)
         video_frame = bs * ts
 
-        sequence_output, visual_output = self.get_sequence_visual_output(input_ids, token_type_ids, attention_mask,
+        sequence_output, visual_output, extras = self.get_sequence_visual_output(input_ids, token_type_ids, attention_mask,
                                                                          video, video_mask, shaped=True, video_frame=video_frame)
 
         if self.training:
@@ -269,10 +292,173 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             sim_loss2 = self.loss_fct(sim_matrix.T)
             sim_loss = (sim_loss1 + sim_loss2) / 2
             loss += sim_loss
+            log = {"loss_global": float(sim_loss.detach().cpu())}
+
+            if (self.plot is not None) and (extras is not None):
+                bs_pair = input_ids.size(0)
+
+                # 来自一次 encode_* 的 token/hidden（包含 CLS）；Bridge 内部会自行去 CLS
+                txt_tokens_all = extras["txt_hidden"]                  # [B, P, Lt, D]
+                vid_tokens_all = extras["vid_hidden"]                  # [B, T, Lv, D]
+
+                # 文本 mask（包含 CLS）；Bridge 内部会去 CLS
+                txt_mask_all   = attention_mask.view(bs_pair, -1, attention_mask.size(-1))   # [B, P, Lt]
+
+                # 与 PLOT 同步的启用时机
+                cur_epoch  = getattr(self, "current_epoch", 0)
+                use_metric = (cur_epoch > getattr(self, "start_metric", 0))   # 默认 >15
+                use_recon  = (cur_epoch > getattr(self, "start_recon", 0))    # 默认 >5
+
+                # pid：若没有 ReID ID，就用 arange(B) 让每个 (b,·) 仅与自身成正
+                pid = getattr(self, "pids", None)
+                if (pid is None) or (pid.numel() != bs_pair):
+                    pid = torch.arange(bs_pair, device=sequence_output.device)
+
+                outs = self.plot(
+                    vid_tokens_all=vid_tokens_all,
+                    txt_tokens_all=txt_tokens_all,
+                    txt_mask_all=txt_mask_all,
+                    txt_global_all=sequence_output,
+                    logit_scale=self.plot_logit_scale,
+                    pid=pid,
+                    use_metric=use_metric,
+                    use_recon=use_recon,
+                    recon_weight=getattr(self, "recon_weight", 0.01),
+                )
+
+                loss_part  = outs.get("loss_part", None)
+                loss_recon = outs.get("loss_recon", None)
+
+                if (loss_part is not None) and use_metric:
+                    total_loss = total_loss + self.partnce_weight * loss_part
+                    log["loss_part_raw"] = float(loss_part.detach().cpu())
+                    log["loss_part_w"]   = float((self.partnce_weight * loss_part).detach().cpu())
+                else:
+                    log["loss_part_raw"] = 0.0
+                    log["loss_part_w"]   = 0.0
+
+                if (loss_recon is not None) and use_recon:
+                    total_loss = total_loss + self.recon_weight * loss_recon
+                    log["loss_recon_raw"] = float(loss_recon.detach().cpu())
+                    log["loss_recon_w"]   = float((self.recon_weight * loss_recon).detach().cpu())
+                else:
+                    log["loss_recon_raw"] = 0.0
+                    log["loss_recon_w"]   = 0.0
+
+                # 3) 占比（按“加权后”的贡献来算）
+                tot = float(total_loss.detach().cpu())
+                pg = log["loss_global"] / tot if tot > 0 else 0.0
+                pp = log["loss_part_w"] / tot if tot > 0 else 0.0
+                pr = log["loss_recon_w"] / tot if tot > 0 else 0.0
+
+                log.update({
+                    "loss_total": tot,
+                    "prop_global": pg,             # 全局对比（加权后 = 本身）
+                    "prop_part":   pp,             # 部件对比（乘权重后）
+                    "prop_recon":  pr,             # 重建（乘权重后）
+                })
+                self._last_log = log
 
             return loss
         else:
             return None
+
+    # ========== 评估用：文本局部槽特征 ==========
+    @torch.no_grad()
+    def encode_text_local(self, input_ids, attention_mask):
+        """
+        返回：
+        txt_global: [N_txt, D]
+        t_local:   [N_txt, S, D]           # 槽特征（最后一次 SlotAttention 迭代）
+        part_w:    [N_txt, S] 或 None      # 文本导出的槽权重（有 text_slot_classifier 才有）
+        """
+        self.eval()
+
+        # pooled + token hidden（含 CLS）
+        txt_global, txt_hidden = self.clip.encode_text(input_ids, return_hidden=True)    # [N,D], [N,L,D]
+
+        # 去 CLS 后做文本侧 SlotAttention（一次性 batch）
+        t_tok = txt_hidden[:, 1:, :]                                 # [N, Lt-1, D]
+        t_msk = attention_mask[:, 1:] if attention_mask is not None else None
+
+        assert self.plot is not None, "PLOT bridge not attached"
+        t_list, _ = self.plot.slot_t(self.plot.slots, t_tok, mask=t_msk)  # list[it][N,S,D]
+        t_local = t_list[-1]                                              # [N,S,D]
+
+        # 文本槽权重（如有则 softmax）
+        if hasattr(self.plot, "text_slot_classifier"):
+            part_w = torch.softmax(self.plot.text_slot_classifier(txt_global), dim=1)    # [N,S]
+        else:
+            part_w = None
+
+        return txt_global, t_local, part_w
+
+    # ========== 评估用：视频局部槽特征 ==========
+    @torch.no_grad()
+    def encode_video_local(self, video, video_frame):
+        """
+        返回：
+        vid_global: [N_vid, D]             # 帧均值后的全局向量
+        v_local:    [N_vid, S, D]          # 帧均值后的槽特征
+        """
+        self.eval()
+
+        # pooled + token hidden（每帧一条；含 CLS）
+        vid_global, vid_hidden = self.clip.encode_image(video, return_hidden=True, video_frame=video_frame)
+        NF = vid_global.size(0); F = video_frame; N = NF // F
+
+        # 还原帧维
+        vid_global = vid_global.view(N, F, -1)                                   # [N,F,D]
+        vid_hidden = vid_hidden.view(N, F, vid_hidden.size(1), vid_hidden.size(2))  # [N,F,L,D]
+
+        # 去 CLS；合帧一次过 SlotAttention，再在帧维上平均
+        v_tok = vid_hidden[:, :, 1:, :]                                          # [N,F,Lv-1,D]
+        v_tok_flat = v_tok.reshape(N*F, v_tok.size(-2), v_tok.size(-1))          # [N*F,Lv-1,D]
+        v_list, _ = self.plot.slot_v(self.plot.slots, v_tok_flat)                # list[it][N*F,S,D]
+        v_local = v_list[-1].view(N, F, -1, v_list[-1].size(-1)).mean(dim=1)     # [N,S,D]
+
+        vid_global = vid_global.mean(dim=1)                                      # [N,D]
+        return vid_global, v_local
+
+    # ========== 评估用：全局+槽级相似度融合 ==========
+    @torch.no_grad()
+    def fuse_similarity_with_slots(self, txt_global, t_local, part_w, vid_global, v_local,
+                                use_part_w=True, start_metric=None):
+        """
+        输入：
+        txt_global: [N_txt,D]   t_local: [N_txt,S,D]   part_w: [N_txt,S] or None
+        vid_global: [N_vid,D]   v_local: [N_vid,S,D]
+        输出：
+        similarity: [N_txt, N_vid]  （全局 + 局部）
+        """
+        self.eval()
+        import torch.nn.functional as F
+
+        # 全局相似度（L2 归一化后内积）
+        q = F.normalize(txt_global, dim=1)
+        g = F.normalize(vid_global, dim=1)
+        sim_global = q @ g.t()                                                  # [N_txt,N_vid]
+
+        # 槽级相似度（逐槽对齐，L2 归一化）
+        t_norm = F.normalize(t_local, dim=2)                                    # [N_txt,S,D]
+        v_norm = F.normalize(v_local, dim=2)                                    # [N_vid,S,D]
+        # (b,s,d) · (n,s,d) -> (b,s,n)
+        part_sim = torch.einsum('bsd,nsd->bsn', t_norm, v_norm)                 # [N_txt,S,N_vid]
+
+        # 融合方式：有 part_w 就加权，否则按槽 sigmoid 累加（与 PLOT eval 一致）
+        if use_part_w and (part_w is not None):
+            sim_part = torch.einsum('bsn,bs->bn', part_sim, part_w)             # [N_txt,N_vid]
+        else:
+            sim_part = torch.sigmoid(part_sim[:, 0])
+            for s in range(1, part_sim.size(1)):
+                sim_part = sim_part + torch.sigmoid(part_sim[:, s])             # [N_txt,N_vid]
+
+        # 与 PLOT 一致的门控：默认直接加；若传入 start_metric，则“开启槽”的条件为 True 才加
+        if start_metric is None:
+            similarity = sim_global + sim_part
+        else:
+            similarity = sim_global + sim_part  # 评估阶段通常直接融合；若严格复刻，可外部判断 epoch>start_metric
+        return similarity
 
     def get_sequence_output(self, input_ids, token_type_ids, attention_mask, shaped=False):
         if shaped is False:
@@ -312,10 +498,32 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             video = video.view(b * pair * bs * ts, channel, h, w)
             video_frame = bs * ts
 
-        sequence_output = self.get_sequence_output(input_ids, token_type_ids, attention_mask, shaped=True)
-        visual_output = self.get_visual_output(video, video_mask, shaped=True, video_frame=video_frame)
+        bs_pair = input_ids.size(0)
 
-        return sequence_output, visual_output
+        if getattr(self, 'use_psa', False):
+            txt_global, txt_hidden = self.clip.encode_text(input_ids, return_hidden=True)         # [B*pair, D], [B*pair, Lt, D]
+            vid_global, vid_hidden = self.clip.encode_image(video, return_hidden=True, video_frame=video_frame)  # [B*frames, D], [B*frames, Lv, D]
+        else:
+            txt_global = self.clip.encode_text(input_ids)                                         # [B*pair, D]
+            vid_global = self.clip.encode_image(video, video_frame=video_frame)                   # [B*frames, D]
+            txt_hidden = vid_hidden = None
+
+        # 还原成 [bs_pair, pair, ...] / [bs_pair, frames, ...]
+        sequence_output = txt_global.view(bs_pair, -1, txt_global.size(-1))       # 文本 pooled
+        visual_output   = vid_global.view(bs_pair, -1, vid_global.size(-1))       # 视频 pooled（逐帧）
+
+        extras = None
+        if txt_hidden is not None and vid_hidden is not None:
+            # 文本 hidden: [bs_pair, pair, Lt, D]
+            txt_hidden = txt_hidden.view(bs_pair, -1, txt_hidden.size(1), txt_hidden.size(2))
+            # 视频 hidden: [bs_pair, frames, Lv, D]
+            vid_hidden = vid_hidden.view(bs_pair, -1, vid_hidden.size(1), vid_hidden.size(2))
+            extras = {
+                "txt_hidden": txt_hidden,
+                "vid_hidden": vid_hidden,
+            }
+
+        return sequence_output, visual_output, extras
 
     def _get_cross_output(self, sequence_output, visual_output, attention_mask, video_mask):
 

@@ -296,6 +296,18 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                             len(train_dataloader), "-".join([str('%.9f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
                             float(loss),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
+                lg = model._last_log or {}
+                logger.info(
+                    f"[E{epoch} S{global_step}] "
+                    f"total={lg.get('loss_total', 0):.4f}  "
+                    f"global={lg.get('loss_global', 0):.4f} "
+                    f"| part={lg.get('w_part', 0):.3g}×{lg.get('loss_part_raw', 0):.4f}"
+                    f"={lg.get('loss_part_w', 0):.4f} "
+                    f"| recon={lg.get('w_recon', 0):.3g}×{lg.get('loss_recon_raw', 0):.4f}"
+                    f"={lg.get('loss_recon_w', 0):.4f}  "
+                    f"-> prop[g/p/r]={lg.get('prop_global',0):.2%}/"
+                    f"{lg.get('prop_part',0):.2%}/{lg.get('prop_recon',0):.2%}"
+                )
                 start_time = time.time()
 
     total_loss = total_loss / len(train_dataloader)
@@ -318,116 +330,214 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
         sim_matrix.append(each_row)
     return sim_matrix
 
-def eval_epoch(args, model, test_dataloader, device, n_gpu):
+def _run_on_single_gpu_slots(model, batch_text_feats, batch_video_feats,
+                             use_part_w=True, start_metric=None):
+    """
+    与 _run_on_single_gpu 等价的“槽版”：输入是已经缓存好的局部/全局特征，
+    输出是相似度子矩阵列表（按原文件的拼接逻辑）。
+    batch_text_feats: List[ (txt_g:[Nt,D], t_local:[Nt,S,D], part_w:[Nt,S] or None) ]
+    batch_video_feats: List[ (vid_g:[Nv,D], v_local:[Nv,S,D]) ]
+    """
+    import numpy as np
+    sim_matrix = []
+    for idx1, (txt_g, t_local, part_w) in enumerate(batch_text_feats):
+        each_row = []
+        for idx2, (vid_g, v_local) in enumerate(batch_video_feats):
+            sim = model.fuse_similarity_with_slots(
+                txt_global=txt_g, t_local=t_local, part_w=part_w,
+                vid_global=vid_g, v_local=v_local,
+                use_part_w=use_part_w, start_metric=start_metric
+            )  # [Nt, Nv]
+            each_row.append(sim.cpu().numpy())
+        each_row = np.concatenate(tuple(each_row), axis=-1)     # 拼列
+        sim_matrix.append(each_row)
+    return sim_matrix
 
+
+@torch.no_grad()
+def evaluate_with_slots(model, all_input_ids, all_attention_mask, all_video, video_frame,
+                        use_part_w=True):
+    device = next(model.parameters()).device
+
+    # 1) 取文本/视频的全局与槽特征
+    txt_g, t_local, part_w = model.encode_text_local(all_input_ids.to(device),
+                                                     all_attention_mask.to(device))
+    vid_g, v_local = model.encode_video_local(all_video.to(device),
+                                              video_frame=video_frame)
+
+    # 2) 融合全局+槽级相似度（与 PLOT 一致）
+    sim = model.fuse_similarity_with_slots(
+        txt_global=txt_g, t_local=t_local, part_w=part_w,
+        vid_global=vid_g, v_local=v_local,
+        use_part_w=use_part_w,
+        start_metric=getattr(model, "start_metric", None)
+    )  # [N_txt, N_vid]
+
+    return sim.cpu()
+
+def eval_epoch(args, model, test_dataloader, device, n_gpu):
     if hasattr(model, 'module'):
         model = model.module.to(device)
     else:
         model = model.to(device)
 
-    # #################################################################
-    ## below variables are used to multi-sentences retrieval
-    # multi_sentence_: important tag for eval
-    # cut_off_points: used to tag the label when calculate the metric
-    # sentence_num: used to cut the sentence representation
-    # video_num: used to cut the video representation
-    # #################################################################
-    multi_sentence_ = False
-    cut_off_points_, sentence_num_, video_num_ = [], -1, -1
-    if hasattr(test_dataloader.dataset, 'multi_sentence_per_video') \
-            and test_dataloader.dataset.multi_sentence_per_video:
-        multi_sentence_ = True
-        cut_off_points_ = test_dataloader.dataset.cut_off_points
-        sentence_num_ = test_dataloader.dataset.sentence_num
-        video_num_ = test_dataloader.dataset.video_num
-        cut_off_points_ = [itm - 1 for itm in cut_off_points_]
+    # …(multi_sentence_ 保持原样)…
 
-    if multi_sentence_:
-        logger.warning("Eval under the multi-sentence per video clip setting.")
-        logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
+    # —— 新增：是否启用槽评估（自动探测或用 args.eval_with_slots 控制）——
+    use_slots_eval = (getattr(args, 'eval_with_slots', False)
+                      or (hasattr(model, 'plot') and (model.plot is not None)))
 
     model.eval()
     with torch.no_grad():
         batch_list_t = []
         batch_list_v = []
-        batch_sequence_output_list, batch_visual_output_list = [], []
+        batch_sequence_output_list, batch_visual_output_list = [], []  # 原来的缓存（保留以兼容旧路径）
+        # —— 新增：槽版缓存 —— #
+        batch_text_feats_slots, batch_video_feats_slots = [], []
+
         total_video_num = 0
 
-        # ----------------------------
-        # 1. cache the features
-        # ----------------------------
+        # 1) cache the features
         for bid, batch in enumerate(test_dataloader):
             batch = tuple(t.to(device) for t in batch)
             input_ids, input_mask, segment_ids, video, video_mask = batch
 
             if multi_sentence_:
-                # multi-sentences retrieval means: one clip has two or more descriptions.
-                b, *_t = video.shape
-                sequence_output = model.get_sequence_output(input_ids, segment_ids, input_mask)
-                batch_sequence_output_list.append(sequence_output)
-                batch_list_t.append((input_mask, segment_ids,))
+                # 文本端：多句直接一次性抽取局部/全局
+                if use_slots_eval:
+                    txt_g, t_local, part_w = model.encode_text_local(input_ids, input_mask)
+                    batch_text_feats_slots.append((txt_g, t_local, part_w))
+                    batch_list_t.append((input_mask, segment_ids,))   # 为了保持结构统一
+                else:
+                    sequence_output = model.get_sequence_output(input_ids, segment_ids, input_mask)
+                    batch_sequence_output_list.append(sequence_output)
+                    batch_list_t.append((input_mask, segment_ids,))
 
+                # 视频端：与原逻辑保持一致的“去重/裁切”
+                b, *_t = video.shape
                 s_, e_ = total_video_num, total_video_num + b
                 filter_inds = [itm - s_ for itm in cut_off_points_ if itm >= s_ and itm < e_]
-
                 if len(filter_inds) > 0:
                     video, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
-                    visual_output = model.get_visual_output(video, video_mask)
-                    batch_visual_output_list.append(visual_output)
-                    batch_list_v.append((video_mask,))
+                    if use_slots_eval:
+                        vid_g, v_local = model.encode_video_local(video, video_frame=args.max_frames)
+                        batch_video_feats_slots.append((vid_g, v_local))
+                        batch_list_v.append((video_mask,))
+                    else:
+                        visual_output = model.get_visual_output(video, video_mask)
+                        batch_visual_output_list.append(visual_output)
+                        batch_list_v.append((video_mask,))
                 total_video_num += b
+
             else:
-                sequence_output, visual_output = model.get_sequence_visual_output(input_ids, segment_ids, input_mask, video, video_mask)
-
-                batch_sequence_output_list.append(sequence_output)
-                batch_list_t.append((input_mask, segment_ids,))
-
-                batch_visual_output_list.append(visual_output)
-                batch_list_v.append((video_mask,))
+                # 单句设置：一对一缓存
+                if use_slots_eval:
+                    txt_g, t_local, part_w = model.encode_text_local(input_ids, input_mask)
+                    vid_g, v_local = model.encode_video_local(video, video_frame=args.max_frames)
+                    batch_text_feats_slots.append((txt_g, t_local, part_w))
+                    batch_video_feats_slots.append((vid_g, v_local))
+                    batch_list_t.append((input_mask, segment_ids,))
+                    batch_list_v.append((video_mask,))
+                else:
+                    sequence_output, visual_output = model.get_sequence_visual_output(
+                        input_ids, segment_ids, input_mask, video, video_mask)
+                    batch_sequence_output_list.append(sequence_output)
+                    batch_visual_output_list.append(visual_output)
+                    batch_list_t.append((input_mask, segment_ids,))
+                    batch_list_v.append((video_mask,))
 
             print("{}/{}\r".format(bid, len(test_dataloader)), end="")
 
-        # ----------------------------------
-        # 2. calculate the similarity
-        # ----------------------------------
+        # 2) calculate the similarity
         if n_gpu > 1:
             device_ids = list(range(n_gpu))
-            batch_list_t_splits = []
-            batch_list_v_splits = []
-            batch_t_output_splits = []
-            batch_v_output_splits = []
             bacth_len = len(batch_list_t)
             split_len = (bacth_len + n_gpu - 1) // n_gpu
-            for dev_id in device_ids:
-                s_, e_ = dev_id * split_len, (dev_id + 1) * split_len
-                if dev_id == 0:
-                    batch_list_t_splits.append(batch_list_t[s_:e_])
-                    batch_list_v_splits.append(batch_list_v)
 
-                    batch_t_output_splits.append(batch_sequence_output_list[s_:e_])
-                    batch_v_output_splits.append(batch_visual_output_list)
-                else:
-                    devc = torch.device('cuda:{}'.format(str(dev_id)))
-                    devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_t[s_:e_]]
-                    batch_list_t_splits.append(devc_batch_list)
-                    devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_v]
-                    batch_list_v_splits.append(devc_batch_list)
+            if use_slots_eval:
+                # 与原文件完全一致的“分片+广播”，只不过对象从 logits 变成了 (特征→相似度)
+                batch_list_t_splits, batch_list_v_splits = [], []
+                batch_text_feats_splits, batch_video_feats_splits = [], []
+                for dev_id in device_ids:
+                    s_, e_ = dev_id * split_len, (dev_id + 1) * split_len
+                    if dev_id == 0:
+                        batch_list_t_splits.append(batch_list_t[s_:e_])
+                        batch_list_v_splits.append(batch_list_v)
 
-                    devc_batch_list = [b.to(devc) for b in batch_sequence_output_list[s_:e_]]
-                    batch_t_output_splits.append(devc_batch_list)
-                    devc_batch_list = [b.to(devc) for b in batch_visual_output_list]
-                    batch_v_output_splits.append(devc_batch_list)
+                        batch_text_feats_splits.append(batch_text_feats_slots[s_:e_])
+                        batch_video_feats_splits.append(batch_video_feats_slots)
+                    else:
+                        devc = torch.device('cuda:{}'.format(str(dev_id)))
+                        # 把缓存的张量搬到该 GPU
+                        def to_dev_text(lst):
+                            out = []
+                            for (g, tloc, pw) in lst:
+                                out.append((g.to(devc), tloc.to(devc), (pw.to(devc) if pw is not None else None)))
+                            return out
+                        def to_dev_video(lst):
+                            out = []
+                            for (g, vloc) in lst:
+                                out.append((g.to(devc), vloc.to(devc)))
+                            return out
 
-            parameters_tuple_list = [(batch_list_t_splits[dev_id], batch_list_v_splits[dev_id],
-                                      batch_t_output_splits[dev_id], batch_v_output_splits[dev_id]) for dev_id in device_ids]
-            parallel_outputs = parallel_apply(_run_on_single_gpu, model, parameters_tuple_list, device_ids)
-            sim_matrix = []
-            for idx in range(len(parallel_outputs)):
-                sim_matrix += parallel_outputs[idx]
-            sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+                        batch_list_t_splits.append([tuple(t.to(devc) for t in b) for b in batch_list_t[s_:e_]])
+                        batch_list_v_splits.append([tuple(t.to(devc) for t in b) for b in batch_list_v])
+
+                        batch_text_feats_splits.append(to_dev_text(batch_text_feats_slots[s_:e_]))
+                        batch_video_feats_splits.append(to_dev_video(batch_video_feats_slots))
+
+                parameters_tuple_list = [
+                    (batch_text_feats_splits[dev_id], batch_video_feats_splits[dev_id])
+                    for dev_id in device_ids
+                ]
+                # 注意：parallel_apply 的 “module” 仍然传 model（它会在各 device 上做 forward）
+                parallel_outputs = parallel_apply(_run_on_single_gpu_slots, model, parameters_tuple_list, device_ids)
+                sim_matrix = []
+                for idx in range(len(parallel_outputs)):
+                    sim_matrix += parallel_outputs[idx]
+                sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+
+            else:
+                # 原有全局 CLIP4Clip 评估（保持原样）
+                batch_list_t_splits, batch_list_v_splits = [], []
+                batch_t_output_splits, batch_v_output_splits = [], []
+                for dev_id in device_ids:
+                    s_, e_ = dev_id * split_len, (dev_id + 1) * split_len
+                    if dev_id == 0:
+                        batch_list_t_splits.append(batch_list_t[s_:e_])
+                        batch_list_v_splits.append(batch_list_v)
+                        batch_t_output_splits.append(batch_sequence_output_list[s_:e_])
+                        batch_v_output_splits.append(batch_visual_output_list)
+                    else:
+                        devc = torch.device('cuda:{}'.format(str(dev_id)))
+                        devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_t[s_:e_]]
+                        batch_list_t_splits.append(devc_batch_list)
+                        devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_v]
+                        batch_list_v_splits.append(devc_batch_list)
+
+                        devc_batch_list = [b.to(devc) for b in batch_sequence_output_list[s_:e_]]
+                        batch_t_output_splits.append(devc_batch_list)
+                        devc_batch_list = [b.to(devc) for b in batch_visual_output_list]
+                        batch_v_output_splits.append(devc_batch_list)
+
+                parameters_tuple_list = [(batch_list_t_splits[dev_id], batch_list_v_splits[dev_id],
+                                          batch_t_output_splits[dev_id], batch_v_output_splits[dev_id])
+                                         for dev_id in device_ids]
+                parallel_outputs = parallel_apply(_run_on_single_gpu, model, parameters_tuple_list, device_ids)
+                sim_matrix = []
+                for idx in range(len(parallel_outputs)):
+                    sim_matrix += parallel_outputs[idx]
+                sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+
         else:
-            sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list)
-            sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+            # 单 GPU：直接调用对应的单 GPU 例程
+            if use_slots_eval:
+                sim_matrix = _run_on_single_gpu_slots(model, batch_text_feats_slots, batch_video_feats_slots)
+                sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+            else:
+                sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v,
+                                                batch_sequence_output_list, batch_visual_output_list)
+                sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
 
     if multi_sentence_:
         logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
@@ -469,6 +579,11 @@ def main():
 
     assert  args.task_type == "retrieval"
     model = init_model(args, device, n_gpu, args.local_rank)
+
+    if getattr(model, "plot", None) is not None:
+        n_vid = int(model.clip.state_dict()["visual.positional_embedding"].shape[0] - 1)
+        n_txt = int(model.clip.state_dict()["positional_embedding"].shape[0] - 1)
+        model.plot._ensure_decoders(n_vid, n_txt)
 
     ## ####################################
     # freeze testing
