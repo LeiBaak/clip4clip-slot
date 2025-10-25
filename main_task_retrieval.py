@@ -17,6 +17,8 @@ from modules.optimization import BertAdam
 
 from util import parallel_apply, get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
+import copy
+import torch.distributed as dist
 
 torch.distributed.init_process_group(backend="nccl")
 
@@ -104,6 +106,12 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
 
+    parser.add_argument('--use_psa', action='store_true', help='enable PLOT/PSA head')
+
+    parser.add_argument('--debug_steps_per_epoch', type=int, default=1,
+                    help='If >0, run only this many optimizer steps per epoch (DDP-safe).')
+    parser.add_argument('--eval_with_slots', action='store_true',)
+
     args = parser.parse_args()
 
     if args.sim_header == "tightTransf":
@@ -133,10 +141,11 @@ def set_seed_logger(args):
     torch.backends.cudnn.deterministic = True
 
     world_size = torch.distributed.get_world_size()
-    torch.cuda.set_device(args.local_rank)
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
     args.world_size = world_size
-    rank = torch.distributed.get_rank()
-    args.rank = rank
+    args.rank = local_rank
+    args.local_rank = local_rank
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
@@ -257,6 +266,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
     start_time = time.time()
     total_loss = 0
 
+    opt_steps = 0
     for step, batch in enumerate(train_dataloader):
         if n_gpu == 1:
             # multi-gpu does scattering it-self
@@ -282,6 +292,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 
             optimizer.step()
             optimizer.zero_grad()
+            opt_steps += 1
 
             # https://github.com/openai/CLIP/issues/46
             if hasattr(model, 'module'):
@@ -296,19 +307,20 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                             len(train_dataloader), "-".join([str('%.9f'%itm) for itm in sorted(list(set(optimizer.get_lr())))]),
                             float(loss),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
-                lg = model._last_log or {}
+                mm = model.module if hasattr(model, "module") else model
+                lg = getattr(mm, "_last_log", None) or {}
                 logger.info(
                     f"[E{epoch} S{global_step}] "
                     f"total={lg.get('loss_total', 0):.4f}  "
                     f"global={lg.get('loss_global', 0):.4f} "
-                    f"| part={lg.get('w_part', 0):.3g}×{lg.get('loss_part_raw', 0):.4f}"
-                    f"={lg.get('loss_part_w', 0):.4f} "
-                    f"| recon={lg.get('w_recon', 0):.3g}×{lg.get('loss_recon_raw', 0):.4f}"
-                    f"={lg.get('loss_recon_w', 0):.4f}  "
+                    f"| part={lg.get('loss_part_w', 0):.4f} (raw={lg.get('loss_part_raw', 0):.4f}) "
+                    f"| recon={lg.get('loss_recon_w', 0):.4f} (raw={lg.get('loss_recon_raw', 0):.4f}) "
                     f"-> prop[g/p/r]={lg.get('prop_global',0):.2%}/"
                     f"{lg.get('prop_part',0):.2%}/{lg.get('prop_recon',0):.2%}"
                 )
                 start_time = time.time()
+        if args.debug_steps_per_epoch > 0 and opt_steps >= args.debug_steps_per_epoch:
+            break
 
     total_loss = total_loss / len(train_dataloader)
     return total_loss, global_step
@@ -382,6 +394,19 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
         model = model.to(device)
 
     # …(multi_sentence_ 保持原样)…
+    multi_sentence_ = False
+    cut_off_points_, sentence_num_, video_num_ = [], -1, -1
+    if hasattr(test_dataloader.dataset, 'multi_sentence_per_video') \
+            and test_dataloader.dataset.multi_sentence_per_video:
+        multi_sentence_ = True
+        cut_off_points_ = test_dataloader.dataset.cut_off_points
+        sentence_num_ = test_dataloader.dataset.sentence_num
+        video_num_ = test_dataloader.dataset.video_num
+        cut_off_points_ = [itm - 1 for itm in cut_off_points_]
+
+    if multi_sentence_:
+        logger.warning("Eval under the multi-sentence per video clip setting.")
+        logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
 
     # —— 新增：是否启用槽评估（自动探测或用 args.eval_with_slots 控制）——
     use_slots_eval = (getattr(args, 'eval_with_slots', False)
@@ -448,96 +473,49 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
 
             print("{}/{}\r".format(bid, len(test_dataloader)), end="")
 
+        if use_slots_eval:
+            # 不走 parallel_apply，直接单卡
+            sim_matrix = _run_on_single_gpu_slots(model, batch_text_feats_slots, batch_video_feats_slots)
+            sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
         # 2) calculate the similarity
-        if n_gpu > 1:
+        elif n_gpu > 1:
             device_ids = list(range(n_gpu))
+            batch_list_t_splits = []
+            batch_list_v_splits = []
+            batch_t_output_splits = []
+            batch_v_output_splits = []
             bacth_len = len(batch_list_t)
             split_len = (bacth_len + n_gpu - 1) // n_gpu
+            for dev_id in device_ids:
+                s_, e_ = dev_id * split_len, (dev_id + 1) * split_len
+                if dev_id == 0:
+                    batch_list_t_splits.append(batch_list_t[s_:e_])
+                    batch_list_v_splits.append(batch_list_v)
 
-            if use_slots_eval:
-                # 与原文件完全一致的“分片+广播”，只不过对象从 logits 变成了 (特征→相似度)
-                batch_list_t_splits, batch_list_v_splits = [], []
-                batch_text_feats_splits, batch_video_feats_splits = [], []
-                for dev_id in device_ids:
-                    s_, e_ = dev_id * split_len, (dev_id + 1) * split_len
-                    if dev_id == 0:
-                        batch_list_t_splits.append(batch_list_t[s_:e_])
-                        batch_list_v_splits.append(batch_list_v)
+                    batch_t_output_splits.append(batch_sequence_output_list[s_:e_])
+                    batch_v_output_splits.append(batch_visual_output_list)
+                else:
+                    devc = torch.device('cuda:{}'.format(str(dev_id)))
+                    devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_t[s_:e_]]
+                    batch_list_t_splits.append(devc_batch_list)
+                    devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_v]
+                    batch_list_v_splits.append(devc_batch_list)
 
-                        batch_text_feats_splits.append(batch_text_feats_slots[s_:e_])
-                        batch_video_feats_splits.append(batch_video_feats_slots)
-                    else:
-                        devc = torch.device('cuda:{}'.format(str(dev_id)))
-                        # 把缓存的张量搬到该 GPU
-                        def to_dev_text(lst):
-                            out = []
-                            for (g, tloc, pw) in lst:
-                                out.append((g.to(devc), tloc.to(devc), (pw.to(devc) if pw is not None else None)))
-                            return out
-                        def to_dev_video(lst):
-                            out = []
-                            for (g, vloc) in lst:
-                                out.append((g.to(devc), vloc.to(devc)))
-                            return out
+                    devc_batch_list = [b.to(devc) for b in batch_sequence_output_list[s_:e_]]
+                    batch_t_output_splits.append(devc_batch_list)
+                    devc_batch_list = [b.to(devc) for b in batch_visual_output_list]
+                    batch_v_output_splits.append(devc_batch_list)
 
-                        batch_list_t_splits.append([tuple(t.to(devc) for t in b) for b in batch_list_t[s_:e_]])
-                        batch_list_v_splits.append([tuple(t.to(devc) for t in b) for b in batch_list_v])
-
-                        batch_text_feats_splits.append(to_dev_text(batch_text_feats_slots[s_:e_]))
-                        batch_video_feats_splits.append(to_dev_video(batch_video_feats_slots))
-
-                parameters_tuple_list = [
-                    (batch_text_feats_splits[dev_id], batch_video_feats_splits[dev_id])
-                    for dev_id in device_ids
-                ]
-                # 注意：parallel_apply 的 “module” 仍然传 model（它会在各 device 上做 forward）
-                parallel_outputs = parallel_apply(_run_on_single_gpu_slots, model, parameters_tuple_list, device_ids)
-                sim_matrix = []
-                for idx in range(len(parallel_outputs)):
-                    sim_matrix += parallel_outputs[idx]
-                sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
-
-            else:
-                # 原有全局 CLIP4Clip 评估（保持原样）
-                batch_list_t_splits, batch_list_v_splits = [], []
-                batch_t_output_splits, batch_v_output_splits = [], []
-                for dev_id in device_ids:
-                    s_, e_ = dev_id * split_len, (dev_id + 1) * split_len
-                    if dev_id == 0:
-                        batch_list_t_splits.append(batch_list_t[s_:e_])
-                        batch_list_v_splits.append(batch_list_v)
-                        batch_t_output_splits.append(batch_sequence_output_list[s_:e_])
-                        batch_v_output_splits.append(batch_visual_output_list)
-                    else:
-                        devc = torch.device('cuda:{}'.format(str(dev_id)))
-                        devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_t[s_:e_]]
-                        batch_list_t_splits.append(devc_batch_list)
-                        devc_batch_list = [tuple(t.to(devc) for t in b) for b in batch_list_v]
-                        batch_list_v_splits.append(devc_batch_list)
-
-                        devc_batch_list = [b.to(devc) for b in batch_sequence_output_list[s_:e_]]
-                        batch_t_output_splits.append(devc_batch_list)
-                        devc_batch_list = [b.to(devc) for b in batch_visual_output_list]
-                        batch_v_output_splits.append(devc_batch_list)
-
-                parameters_tuple_list = [(batch_list_t_splits[dev_id], batch_list_v_splits[dev_id],
-                                          batch_t_output_splits[dev_id], batch_v_output_splits[dev_id])
-                                         for dev_id in device_ids]
-                parallel_outputs = parallel_apply(_run_on_single_gpu, model, parameters_tuple_list, device_ids)
-                sim_matrix = []
-                for idx in range(len(parallel_outputs)):
-                    sim_matrix += parallel_outputs[idx]
-                sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
-
+            parameters_tuple_list = [(batch_list_t_splits[dev_id], batch_list_v_splits[dev_id],
+                                      batch_t_output_splits[dev_id], batch_v_output_splits[dev_id]) for dev_id in device_ids]
+            parallel_outputs = parallel_apply(_run_on_single_gpu, model, parameters_tuple_list, device_ids)
+            sim_matrix = []
+            for idx in range(len(parallel_outputs)):
+                sim_matrix += parallel_outputs[idx]
+            sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
         else:
-            # 单 GPU：直接调用对应的单 GPU 例程
-            if use_slots_eval:
-                sim_matrix = _run_on_single_gpu_slots(model, batch_text_feats_slots, batch_video_feats_slots)
-                sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
-            else:
-                sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v,
-                                                batch_sequence_output_list, batch_visual_output_list)
-                sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+            sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list)
+            sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
 
     if multi_sentence_:
         logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
@@ -579,11 +557,6 @@ def main():
 
     assert  args.task_type == "retrieval"
     model = init_model(args, device, n_gpu, args.local_rank)
-
-    if getattr(model, "plot", None) is not None:
-        n_vid = int(model.clip.state_dict()["visual.positional_embedding"].shape[0] - 1)
-        n_txt = int(model.clip.state_dict()["positional_embedding"].shape[0] - 1)
-        model.plot._ensure_decoders(n_vid, n_txt)
 
     ## ####################################
     # freeze testing
@@ -644,6 +617,8 @@ def main():
                                         / args.gradient_accumulation_steps) * args.epochs
 
         coef_lr = args.coef_lr
+        if args.debug_steps_per_epoch > 0:
+            num_train_optimization_steps = args.epochs * args.debug_steps_per_epoch
         optimizer, scheduler, model = prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, args.local_rank, coef_lr=coef_lr)
 
         if args.local_rank == 0:
@@ -669,9 +644,15 @@ def main():
             train_sampler.set_epoch(epoch)
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
                                                scheduler, global_step, local_rank=args.local_rank)
+            
+            ddp = dist.is_available() and dist.is_initialized()
+            if ddp:
+                torch.cuda.synchronize()
+                dist.barrier()                    # A1: 所有人到齐再保存
+
             if args.local_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
-
+                
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
 
                 ## Run on val dataset, this process is *TIME-consuming*.
@@ -683,6 +664,10 @@ def main():
                     best_score = R1
                     best_output_model_file = output_model_file
                 logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
+            
+            if ddp:
+                torch.cuda.synchronize()
+                dist.barrier()
 
         ## Uncomment if want to test on the best checkpoint
         # if args.local_rank == 0:

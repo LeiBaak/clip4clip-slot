@@ -31,41 +31,8 @@ class SlotAdapter(nn.Module):
             nn.Linear(dim, dim // 8), nn.ReLU(inplace=True), nn.Linear(dim // 8, num_slots)
         )
 
-        # recon decoders will be created lazily to match token grids
-        self.recon_dec_v = None  # MlpDecoder(Hv, Wv, slot_dim=dim, feat_dim=dim)
-        self.recon_dec_t = None  # MlpDecoder(Ht, Wt, slot_dim=dim, feat_dim=dim)
-
-    @staticmethod
-    def _best_hw(n_tokens: int):
-        """Find H,W s.t. H*W=n_tokens and |H-W| is small (prefer square grids)."""
-        # special-case some common CLIP/PLOT layouts
-        if n_tokens == 49:   # ViT-B/32 224px
-            return 7, 7
-        if n_tokens == 196:  # ViT-L/14 224px
-            return 14, 14
-        if n_tokens == 192:  # PLOT默认图像栅格
-            return 24, 8
-        # generic factorization (closest to square)
-        w = int(round(math.sqrt(n_tokens)))
-        best = (1, n_tokens)
-        best_gap = n_tokens - 1
-        for h in range(1, w + 1):
-            if n_tokens % h == 0:
-                cand = (h, n_tokens // h)
-                gap = abs(cand[0] - cand[1])
-                if gap < best_gap:
-                    best, best_gap = cand, gap
-        return best
-
-    def _ensure_decoders(self, n_vid_tokens, n_txt_tokens):
-        # video tokens mapped to H_v × W_v
-        if self.recon_dec_v is None:
-            Hv, Wv = self._best_hw(n_vid_tokens)
-            self.recon_dec_v = MlpDecoder(Hv, Wv, self.dim, self.dim)
-        # text tokens as 1 × L_t
-        if self.recon_dec_t is None:
-            Ht, Wt = 1, n_txt_tokens
-            self.recon_dec_t = MlpDecoder(Ht, Wt, self.dim, self.dim)
+        self.recon_dec_v = MlpDecoder(7, 7, slot_dim=dim, feat_dim=dim)
+        self.recon_dec_t = MlpDecoder(1, 76, slot_dim=dim, feat_dim=dim)
 
     def forward(self, vid_tokens_all, txt_tokens_all, txt_mask_all, txt_global_all, logit_scale, pid,
                 use_metric=True, use_recon=False, recon_weight=0.01, pos_across_frames=False):

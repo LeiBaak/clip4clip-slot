@@ -330,7 +330,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 loss_recon = outs.get("loss_recon", None)
 
                 if (loss_part is not None) and use_metric:
-                    total_loss = total_loss + self.partnce_weight * loss_part
+                    loss = loss + self.partnce_weight * loss_part
                     log["loss_part_raw"] = float(loss_part.detach().cpu())
                     log["loss_part_w"]   = float((self.partnce_weight * loss_part).detach().cpu())
                 else:
@@ -338,7 +338,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                     log["loss_part_w"]   = 0.0
 
                 if (loss_recon is not None) and use_recon:
-                    total_loss = total_loss + self.recon_weight * loss_recon
+                    loss = loss + self.recon_weight * loss_recon
                     log["loss_recon_raw"] = float(loss_recon.detach().cpu())
                     log["loss_recon_w"]   = float((self.recon_weight * loss_recon).detach().cpu())
                 else:
@@ -346,7 +346,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                     log["loss_recon_w"]   = 0.0
 
                 # 3) 占比（按“加权后”的贡献来算）
-                tot = float(total_loss.detach().cpu())
+                tot = float(loss.detach().cpu())
                 pg = log["loss_global"] / tot if tot > 0 else 0.0
                 pp = log["loss_part_w"] / tot if tot > 0 else 0.0
                 pr = log["loss_recon_w"] / tot if tot > 0 else 0.0
@@ -368,57 +368,96 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
     def encode_text_local(self, input_ids, attention_mask):
         """
         返回：
-        txt_global: [N_txt, D]
-        t_local:   [N_txt, S, D]           # 槽特征（最后一次 SlotAttention 迭代）
-        part_w:    [N_txt, S] 或 None      # 文本导出的槽权重（有 text_slot_classifier 才有）
+            txt_global: [N_txt, D]
+            t_local:   [N_txt, S, D]
+            part_w:    [N_txt, S] or None
         """
         self.eval()
 
-        # pooled + token hidden（含 CLS）
-        txt_global, txt_hidden = self.clip.encode_text(input_ids, return_hidden=True)    # [N,D], [N,L,D]
+        # --- 关键：严格对齐 eval 流水线，支持 [B,S,L] / [N,L] ---
+        if input_ids.dim() == 3:
+            b, s, l = input_ids.shape
+            input_ids = input_ids.reshape(b * s, l)
+            if attention_mask is not None and attention_mask.dim() == 3:
+                attention_mask = attention_mask.reshape(b * s, l)
+        elif input_ids.dim() != 2:
+            raise ValueError(f"encode_text_local expects [N,L] or [B,S,L], got {tuple(input_ids.shape)}")
 
-        # 去 CLS 后做文本侧 SlotAttention（一次性 batch）
-        t_tok = txt_hidden[:, 1:, :]                                 # [N, Lt-1, D]
+        # 1) 先取 pooled 和所有 token hidden（与原 get_sequence_output 的 pooled 一致）
+        txt_global, txt_hidden = self.clip.encode_text(input_ids, return_hidden=True)  # [N,D], [N,L,D]
+        txt_global = txt_global.float()
+        txt_hidden = txt_hidden.float()
+
+        # 2) 去 CLS，做文本侧 SlotAttention（一次性 batch）
+        t_tok = txt_hidden[:, 1:, :]
         t_msk = attention_mask[:, 1:] if attention_mask is not None else None
 
         assert self.plot is not None, "PLOT bridge not attached"
         t_list, _ = self.plot.slot_t(self.plot.slots, t_tok, mask=t_msk)  # list[it][N,S,D]
         t_local = t_list[-1]                                              # [N,S,D]
 
-        # 文本槽权重（如有则 softmax）
+        # 3) 可选：文本槽权重
         if hasattr(self.plot, "text_slot_classifier"):
-            part_w = torch.softmax(self.plot.text_slot_classifier(txt_global), dim=1)    # [N,S]
+            part_w = torch.softmax(self.plot.text_slot_classifier(txt_global), dim=1)  # [N,S]
         else:
             part_w = None
 
         return txt_global, t_local, part_w
 
+
     # ========== 评估用：视频局部槽特征 ==========
     @torch.no_grad()
-    def encode_video_local(self, video, video_frame):
+    def encode_video_local(self, video, video_frame=None):
         """
-        返回：
-        vid_global: [N_vid, D]             # 帧均值后的全局向量
-        v_local:    [N_vid, S, D]          # 帧均值后的槽特征
+        输入:
+            video: [..., 3, H, W]，常见 7D: [B, P, BS, TS, 3, H, W]
+            video_frame: 每个样本的帧数（如 12）。如果 None，则尝试从形状推断。
+        返回:
+            vid_global: [Nv, D]   —— 视频全局向量（按帧平均后，每个视频/样本一条）
+            v_local:   [Nv, S, D] —— 槽级局部表示（对时空 token 聚合后的 S 个槽）
         """
         self.eval()
 
-        # pooled + token hidden（每帧一条；含 CLS）
-        vid_global, vid_hidden = self.clip.encode_image(video, return_hidden=True, video_frame=video_frame)
-        NF = vid_global.size(0); F = video_frame; N = NF // F
+        # 基本检查
+        assert video.dim() >= 4, f"expect [...,3,H,W], got {tuple(video.shape)}"
+        *prefix, C, H, W = video.shape
+        assert C == 3, f"expect channel=3, got {C}"
+        assert video_frame is not None and int(video_frame) > 0, "video_frame must be provided and > 0"
 
-        # 还原帧维
-        vid_global = vid_global.view(N, F, -1)                                   # [N,F,D]
-        vid_hidden = vid_hidden.view(N, F, vid_hidden.size(1), vid_hidden.size(2))  # [N,F,L,D]
+        # 展平到 [N,3,H,W]，N = 所有前缀维度连乘
+        N_frames = 1
+        for d in prefix:
+            N_frames *= int(d)
+        vf = int(video_frame)
+        assert N_frames % vf == 0, f"frames {N_frames} not divisible by video_frame {vf}"
+        Nv = N_frames // vf
 
-        # 去 CLS；合帧一次过 SlotAttention，再在帧维上平均
-        v_tok = vid_hidden[:, :, 1:, :]                                          # [N,F,Lv-1,D]
-        v_tok_flat = v_tok.reshape(N*F, v_tok.size(-2), v_tok.size(-1))          # [N*F,Lv-1,D]
-        v_list, _ = self.plot.slot_v(self.plot.slots, v_tok_flat)                # list[it][N*F,S,D]
-        v_local = v_list[-1].view(N, F, -1, v_list[-1].size(-1)).mean(dim=1)     # [N,S,D]
+        # 2) 展平成 4D，送入 CLIP（完全对齐旧路径）
+        video_4d = video.contiguous().view(N_frames, C, H, W)   # [N,3,H,W]
+        vid_global, vid_hidden = self.clip.encode_image(
+            video_4d, return_hidden=True, video_frame=vf
+        )  # vid_global: [N, D]；vid_hidden: [N, L, D]（含 CLS）
+        vid_global = vid_global.float()
+        vid_hidden = vid_hidden.float()
 
-        vid_global = vid_global.mean(dim=1)                                      # [N,D]
+        # 3) 回拼成“每个样本 Nv 一条”的全局特征（按帧平均）
+        D = vid_global.shape[-1]
+        vid_global = vid_global.reshape(Nv, vf, D).mean(dim=1)     # [Nv, D]
+
+        # 4) 取去 CLS 的时空 token，并把“帧 × patch”展平到一个维度，供 slot_v 聚合
+        #    旧路径里相当于把每帧的空间 token 拼起来，然后再做局部聚合/匹配
+        L = vid_hidden.shape[1]                                  # 含 CLS 的长度
+        assert L >= 2, f"unexpected visual seq length L={L}"
+        v_tok = vid_hidden[:, 1:, :]                            # [N, L-1, D] 去掉 CLS
+        v_tok = v_tok.reshape(Nv, vf * (L - 1), D)                 # [Nv, T*Sp, D] 时空展平
+
+        # 5) 槽聚合（保持与文本侧的 slot 使用一致）
+        assert self.plot is not None, "PLOT bridge not attached"
+        v_list, _ = self.plot.slot_v(self.plot.slots, v_tok, mask=None)  # list[it][Nv,S,D]
+        v_local = v_list[-1]                                             # [Nv, S, D]
+
         return vid_global, v_local
+
 
     # ========== 评估用：全局+槽级相似度融合 ==========
     @torch.no_grad()
@@ -502,10 +541,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         if getattr(self, 'use_psa', False):
             txt_global, txt_hidden = self.clip.encode_text(input_ids, return_hidden=True)         # [B*pair, D], [B*pair, Lt, D]
+            txt_global = txt_global.float()
+            txt_hidden = txt_hidden.float()
             vid_global, vid_hidden = self.clip.encode_image(video, return_hidden=True, video_frame=video_frame)  # [B*frames, D], [B*frames, Lv, D]
+            vid_global.float()
+            vid_hidden = vid_hidden.float()
         else:
-            txt_global = self.clip.encode_text(input_ids)                                         # [B*pair, D]
-            vid_global = self.clip.encode_image(video, video_frame=video_frame)                   # [B*frames, D]
+            txt_global = self.clip.encode_text(input_ids).float()                                         # [B*pair, D]
+            vid_global = self.clip.encode_image(video, video_frame=video_frame).float()                   # [B*frames, D]
             txt_hidden = vid_hidden = None
 
         # 还原成 [bs_pair, pair, ...] / [bs_pair, frames, ...]
