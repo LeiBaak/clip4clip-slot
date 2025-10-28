@@ -306,7 +306,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
                 # 与 PLOT 同步的启用时机
                 cur_epoch  = getattr(self, "current_epoch", 0)
-                use_metric = (cur_epoch > getattr(self, "start_metric", 0))   # 默认 >15
+                use_metric = (cur_epoch > getattr(self, "start_metric", 9))   # 默认 >15
                 use_recon  = (cur_epoch > getattr(self, "start_recon", 0))    # 默认 >5
 
                 # pid：若没有 ReID ID，就用 arange(B) 让每个 (b,·) 仅与自身成正

@@ -108,7 +108,7 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
 
     parser.add_argument('--use_psa', action='store_true', help='enable PLOT/PSA head')
 
-    parser.add_argument('--debug_steps_per_epoch', type=int, default=1,
+    parser.add_argument('--debug_steps_per_epoch', type=int, default=0,
                     help='If >0, run only this many optimizer steps per epoch (DDP-safe).')
     parser.add_argument('--eval_with_slots', action='store_true',)
 
@@ -547,6 +547,176 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
     R1 = tv_metrics['R1']
     return R1
 
+# ==== 2) 本 rank 单卡提取特征 ====
+@torch.no_grad()
+def _eval_epoch_features(args, model, loader, device):
+
+    # 如果是分布式，确保 device 正确
+    ddp = dist.is_available() and dist.is_initialized()
+    if ddp:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))   # ← 本进程在本机的 GPU 序号
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")           # ← 用本进程自己的卡
+
+    net = model.module if hasattr(model, "module") else model
+    net.eval()
+
+    T_g, T_l, P_w = [], [], []
+    V_g, V_l      = [], []
+
+    for batch in loader:
+        # MSRVTT 返回的是 tuple:
+        # (pairs_text, pairs_mask, pairs_segment, video, video_mask)
+        pairs_text, pairs_mask, _pairs_segment, video, _video_mask = batch
+
+        # 文本形状可能是 [B, K, L] 或 [B, L]；测试集 K=1，取第 0 路
+        if pairs_text.dim() == 3:  # [B, K, L]
+            input_ids      = pairs_text[:, 0, :]
+            attention_mask = pairs_mask[:, 0, :]
+        else:                      # [B, L]
+            input_ids      = pairs_text
+            attention_mask = pairs_mask
+
+        # 视频形状可能是 [B, K, T, 1, 3, H, W] 或 [B, T, 1, 3, H, W]；若有 K 维，取第 0 路
+        if video.dim() == 7:
+            video = video[:, 0, ...]  # -> [B, T, 1, 3, H, W]
+        
+        input_ids      = input_ids.to(device, dtype=torch.long, non_blocking=True)
+        attention_mask = attention_mask.to(device, dtype=torch.long, non_blocking=True)
+        video = video.to(device, non_blocking=True)
+
+        # 前向（按你现有的接口）
+        txt_g, t_local, part_w = net.encode_text_local(input_ids, attention_mask)
+        vid_g, v_local         = net.encode_video_local(video, video_frame=args.max_frames)
+
+        # 收集到 CPU
+        T_g.append(txt_g.float().cpu())
+        T_l.append(t_local.float().cpu())
+        P_w.append(part_w.float().cpu() if part_w is not None else None)
+        V_g.append(vid_g.float().cpu())
+        V_l.append(v_local.float().cpu())
+
+    # 安全拼接（允许 None）
+    def _cat_safe(tensors):
+        tensors = [t for t in tensors if t is not None]
+        return torch.cat(tensors, dim=0) if tensors else None
+
+    return {
+        "T_g": _cat_safe(T_g),
+        "T_l": _cat_safe(T_l),
+        "P_w": _cat_safe(P_w) if any(t is not None for t in P_w) else None,
+        "V_g": _cat_safe(V_g),
+        "V_l": _cat_safe(V_l),
+    }
+
+# ==== 3) 收集到 rank0，拼相似度矩阵并算指标（分块防 OOM）====
+def eval_epoch_distributed(args, model, test_dataloader, device):
+
+    mine = _eval_epoch_features(args, model, test_dataloader, device)
+
+    ddp = dist.is_available() and dist.is_initialized()
+    if not ddp:
+        gathered = [ {k:(v.numpy() if torch.is_tensor(v) else v) for k,v in mine.items()} ]
+    else:
+        world = dist.get_world_size()
+        gathered = [None for _ in range(world)]
+        dist.all_gather_object(gathered, {k:(v.numpy() if torch.is_tensor(v) else v) for k,v in mine.items()})
+
+    # 只有 rank0 计算指标；完了把 R1 广播给其他 rank，方便统一打印/保存
+    rank = dist.get_rank() if ddp else 0
+    R1 = None
+    if rank == 0:
+        # 1) 拼接（rank 顺序自然对齐，不需要 ids）
+        def cat_np(key):
+            arrs = [g[key] for g in gathered if g[key] is not None]
+            if not arrs: return None
+            return np.concatenate(arrs, axis=0)
+        T_g = cat_np("T_g"); T_l = cat_np("T_l"); P_w = cat_np("P_w")
+        V_g = cat_np("V_g"); V_l = cat_np("V_l")
+
+        # 2) 在 rank0 单卡计算相似度矩阵（可按行分块）
+        net = model.module if hasattr(model, "module") else model
+        local_rank0 = int(os.environ.get("LOCAL_RANK", "0"))   # ✅ 不要硬写 cuda:0
+        dev0 = torch.device(f"cuda:{local_rank0}")
+        net = net.to(dev0).eval()
+
+        Tg = torch.from_numpy(T_g).to(dev0, dtype=torch.float32)
+        Tl = torch.from_numpy(T_l).to(dev0, dtype=torch.float32)
+        Vg = torch.from_numpy(V_g).to(dev0, dtype=torch.float32)
+        Vl = torch.from_numpy(V_l).to(dev0, dtype=torch.float32)
+        Pw = torch.from_numpy(P_w).to(dev0, dtype=torch.float32) if P_w is not None else None
+
+        rows = []
+        bs = 256  # 你可以按显存调
+        with torch.no_grad():
+            for i in range(0, Tg.size(0), bs):
+                j = min(i+bs, Tg.size(0))
+                Sij = net.fuse_similarity_with_slots(
+                    Tg[i:j], Tl[i:j], (Pw[i:j] if Pw is not None else None), Vg, Vl
+                )  # [j-i, Nv]
+                rows.append(Sij.float().cpu())
+        sim = torch.cat(rows, dim=0).numpy()  # [Nt, Nv]
+
+        multi_sentence_ = False
+        cut_off_points_ = []
+        if hasattr(test_dataloader.dataset, 'multi_sentence_per_video') \
+                and test_dataloader.dataset.multi_sentence_per_video:
+            multi_sentence_ = True
+            cut_off_points_ = test_dataloader.dataset.cut_off_points
+            cut_off_points_ = [itm - 1 for itm in cut_off_points_]
+
+
+        # 3) 用你原来的打印/指标逻辑（保持一致）
+        # —— 以下三行示例 —— 若你已有现成函数就直接替换
+        R1 = compute_and_log_metrics_from_sim(sim, multi_sentence_, cut_off_points_)  # <--- 把它替换成你现有的指标打印函数，返回 R1
+
+    # 把 R1 广播给所有 rank（便于后面 best_score 逻辑不分支）
+    if ddp:
+        obj = [float(R1) if rank == 0 else None]
+        dist.broadcast_object_list(obj, src=0)  # ← 所有 rank 都必须调用
+        R1 = obj[0]  # 现在每个 rank 的 R1 都一致（float）
+        
+    return R1
+
+def compute_and_log_metrics_from_sim(sim_matrix, 
+                                     multi_sentence_=False, 
+                                     cut_off_points_=None):
+    """
+    sim_matrix:
+      - 单句设置: [N_txt, N_vid]
+      - 多句设置: 先是 [sum(sent_per_video), N_vid]，会在这里 reshape
+    返回: R1 (Text-to-Video 的 R@1)
+    """
+    if multi_sentence_:
+        logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+        cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
+        max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
+        sim_matrix_new = []
+        for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
+            sim_matrix_new.append(np.concatenate((sim_matrix[s_:e_],
+                                                  np.full((max_length-e_+s_, sim_matrix.shape[1]), -np.inf)), axis=0))
+        sim_matrix = np.stack(tuple(sim_matrix_new), axis=0)
+        logger.info("after reshape, sim matrix size: {} x {} x {}".
+                    format(sim_matrix.shape[0], sim_matrix.shape[1], sim_matrix.shape[2]))
+
+        tv_metrics = tensor_text_to_video_metrics(sim_matrix)
+        vt_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix))
+    else:
+        logger.info("sim matrix size: {}, {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+        tv_metrics = compute_metrics(sim_matrix)
+        vt_metrics = compute_metrics(sim_matrix.T)
+        logger.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix), len(sim_matrix[0])))
+
+    logger.info("Text-to-Video:")
+    logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
+                format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['MR'], tv_metrics['MeanR']))
+    logger.info("Video-to-Text:")
+    logger.info('\t>>>  V2T$R@1: {:.1f} - V2T$R@5: {:.1f} - V2T$R@10: {:.1f} - V2T$Median R: {:.1f} - V2T$Mean R: {:.1f}'.
+                format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
+
+    R1 = tv_metrics['R1']
+    return R1
+
 def main():
     global logger
     args = get_args()
@@ -644,30 +814,26 @@ def main():
             train_sampler.set_epoch(epoch)
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
                                                scheduler, global_step, local_rank=args.local_rank)
-            
-            ddp = dist.is_available() and dist.is_initialized()
-            if ddp:
-                torch.cuda.synchronize()
-                dist.barrier()                    # A1: 所有人到齐再保存
 
-            if args.local_rank == 0:
+            ddp = dist.is_available() and dist.is_initialized()
+            is_rank0 = (not ddp) or (dist.get_rank() == 0)
+            # —— 仅 rank0：打印并保存
+            output_model_file = None  # 占位，避免未定义
+            if is_rank0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
-                
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
 
-                ## Run on val dataset, this process is *TIME-consuming*.
-                # logger.info("Eval on val dataset")
-                # R1 = eval_epoch(args, model, val_dataloader, device, n_gpu)
+            # —— 评估：所有 rank 都调用；函数内部会在 rank0 拼矩阵并广播 R1（float）
+            R1 = eval_epoch_distributed(args, model, test_dataloader, device)
 
-                R1 = eval_epoch(args, model, test_dataloader, device, n_gpu)
-                if best_score <= R1:
+            # —— 仅 rank0：更新 best 并打印
+            if is_rank0:
+                if best_score is None:
+                    best_score = float("-inf")
+                if R1 >= best_score:
                     best_score = R1
                     best_output_model_file = output_model_file
-                logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
-            
-            if ddp:
-                torch.cuda.synchronize()
-                dist.barrier()
+                logger.info("The best model is: %s, the R1 is: %.4f", best_output_model_file, best_score)
 
         ## Uncomment if want to test on the best checkpoint
         # if args.local_rank == 0:
